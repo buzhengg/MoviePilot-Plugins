@@ -25,18 +25,22 @@ from app import schemas
 from app.db import get_async_db
 from app.db.models import User
 from app.db.user_oper import (
+    UserOper,
     get_current_active_superuser_async,
     get_current_active_user_async,
 )
+from app.helper.service import ServiceConfigHelper
 from app.log import logger
 from app.plugins import _PluginBase
-from app.schemas import Notification
+from app.schemas import Notification, NotificationConf
 
 from .apns_client import APNsClient, APNsSendResult
 
 PLUGIN_ID = "MoviePilotAppPush"
 DEVICE_REGISTRY_KEY = "device_registry"
 LAST_TEST_PUSH_KEY = "last_test_push"
+# 与「设定 → 通知 → 自定义」里填写的渠道 type 一致（小写）
+NOTIFICATION_CHANNEL_TYPE = "applepush"
 DEFAULT_BUNDLE_ID = "com.buzheng.MoviePilotApp"
 DEFAULT_TEST_TITLE = "MoviePilot 测试推送"
 DEFAULT_TEST_BODY = "这是一条来自 MoviePilotAppPush 插件的测试通知"
@@ -59,7 +63,7 @@ class DeviceUnregisterRequest(BaseModel):
 class MoviePilotAppPush(_PluginBase):
     plugin_name = "MoviePilot App 推送"
     plugin_desc = "为 MoviePilot iOS / macOS App 提供 APNs 远程推送"
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.2"
     plugin_author = "buzhengg"
     # 与 package.v2.json 的 icon 一致；独立仓库须用 raw.githubusercontent.com 完整 URL
     plugin_icon = "https://raw.githubusercontent.com/buzhengg/MoviePilot-Plugins/main/icons/moviepilotapppush.png"
@@ -146,6 +150,30 @@ class MoviePilotAppPush(_PluginBase):
                                     },
                                 }],
                             },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [{
+                                    "component": "VSwitch",
+                                    "props": {
+                                        "model": "use_system_notification_channel",
+                                        "label": "遵循「设定 → 通知」中的自定义渠道",
+                                        "color": "primary",
+                                    },
+                                }],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [{
+                                    "component": "VSwitch",
+                                    "props": {
+                                        "model": "fallback_without_channel",
+                                        "label": "未配置通知渠道时仍按插件规则转发",
+                                        "color": "warning",
+                                    },
+                                }],
+                            },
                         ],
                     },
                     {
@@ -214,6 +242,8 @@ class MoviePilotAppPush(_PluginBase):
                             "type": "info",
                             "variant": "tonal",
                             "text": (
+                                "建议在「设定 → 通知 → ＋ → 自定义」新增渠道："
+                                f"类型填 {NOTIFICATION_CHANNEL_TYPE}，勾选要接收的消息场景并启用。"
                                 "App 登录后调用 POST /api/v1/plugin/MoviePilotAppPush/register 上报 device token。"
                                 "Debug 包请开启「沙盒环境」；TestFlight / App Store 请关闭。"
                             ),
@@ -224,7 +254,10 @@ class MoviePilotAppPush(_PluginBase):
         ], {
             "enabled": False,
             "use_sandbox": True,
-            "push_broadcast": True,
+            "push_broadcast": False,
+            "use_system_notification_channel": True,
+            "fallback_without_channel": True,
+            "notification_channel_type": NOTIFICATION_CHANNEL_TYPE,
             "team_id": "",
             "key_id": "",
             "auth_key": "",
@@ -468,6 +501,8 @@ class MoviePilotAppPush(_PluginBase):
     def send_push(self, message: Notification, **kwargs) -> None:
         if not self._apns_ready():
             return None
+        if not self._system_notification_allows(message):
+            return None
 
         title = (message.title or "").strip() or "MoviePilot"
         body = (message.text or "").strip()
@@ -520,16 +555,81 @@ class MoviePilotAppPush(_PluginBase):
     def _save_registry(self, registry: Dict[str, List[dict]]) -> None:
         self.save_data(DEVICE_REGISTRY_KEY, registry)
 
+    def _notification_channel_type(self) -> str:
+        raw = self._config.get("notification_channel_type") or NOTIFICATION_CHANNEL_TYPE
+        return str(raw).strip().lower() or NOTIFICATION_CHANNEL_TYPE
+
+    def _load_system_notification_channels(self) -> List[NotificationConf]:
+        channel_type = self._notification_channel_type()
+        return [
+            conf for conf in ServiceConfigHelper.get_notification_configs()
+            if (conf.type or "").strip().lower() == channel_type and conf.enabled and conf.name
+        ]
+
+    @staticmethod
+    def _channel_accepts_message(conf: NotificationConf, message: Notification) -> bool:
+        if message.source and message.source != conf.name:
+            return False
+        if not message.userid and message.mtype:
+            switchs = conf.switchs or []
+            if switchs and message.mtype.value not in switchs:
+                return False
+        return True
+
+    def _system_notification_allows(self, message: Notification) -> bool:
+        if not self._config.get("use_system_notification_channel", True):
+            return True
+
+        channels = self._load_system_notification_channels()
+        if not channels:
+            return bool(self._config.get("fallback_without_channel", True))
+
+        return any(self._channel_accepts_message(conf, message) for conf in channels)
+
+    def _username_from_userid(self, userid: Any) -> Optional[str]:
+        try:
+            uid = int(userid)
+        except (TypeError, ValueError):
+            return None
+        try:
+            user = User.get_by_id(UserOper()._db, uid)
+        except Exception as err:
+            logger.debug("App 推送：按 userid 查用户失败：%s", err)
+            return None
+        return user.name if user else None
+
     def _resolve_target_usernames(self, message: Notification) -> List[str]:
         if message.username:
             return [str(message.username)]
 
-        if self._config.get("push_broadcast", True):
+        if message.userid:
+            name = self._username_from_userid(message.userid)
+            if name:
+                return [name]
+
+        if self._config.get("push_broadcast", False):
             registry = self._load_registry()
             if registry:
                 return list(registry.keys())
 
         return []
+
+    def _system_channel_status_text(self) -> str:
+        if not self._config.get("use_system_notification_channel", True):
+            return "已关闭系统通知渠道联动，仅按插件内规则转发。"
+        channels = self._load_system_notification_channels()
+        channel_type = self._notification_channel_type()
+        if not channels:
+            if self._config.get("fallback_without_channel", True):
+                return (
+                    f"未在「设定 → 通知」中配置 type={channel_type} 的自定义渠道；"
+                    "当前使用插件兜底规则（未配置渠道时仍可能推送）。"
+                )
+            return (
+                f"未配置 type={channel_type} 的通知渠道，且已关闭兜底，系统通知不会转发到 App。"
+            )
+        names = "、".join(conf.name for conf in channels)
+        return f"已联动系统通知渠道（type={channel_type}）：{names}"
 
     def _send_to_device(
             self,
@@ -678,6 +778,14 @@ class MoviePilotAppPush(_PluginBase):
                 "variant": "tonal",
                 "density": "comfortable",
                 "text": self._detail_apns_status_text(),
+            },
+        }, {
+            "component": "VAlert",
+            "props": {
+                "type": "info",
+                "variant": "tonal",
+                "density": "comfortable",
+                "text": self._system_channel_status_text(),
             },
         }]
 
