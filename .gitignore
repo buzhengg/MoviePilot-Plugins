@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.DS_Store
+.idea/
+.vscode/
+*.pem
+AuthKey_*.p8
