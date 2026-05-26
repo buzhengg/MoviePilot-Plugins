@@ -8,8 +8,6 @@ MoviePilot 第三方插件库。
 |---------|------|------|
 | `MoviePilotAppPush` | MoviePilot App 推送 | 为 MoviePilot iOS / macOS App 提供 APNs 远程推送 |
 
-详细说明：[docs/MoviePilotAppPush.md](docs/MoviePilotAppPush.md)
-
 ## 安装
 
 ### 1. 添加市场源

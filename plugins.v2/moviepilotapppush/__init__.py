@@ -29,6 +29,7 @@ from app.db.user_oper import (
     get_current_active_superuser_async,
     get_current_active_user_async,
 )
+from app.core.config import settings
 from app.helper.service import ServiceConfigHelper
 from app.log import logger
 from app.plugins import _PluginBase
@@ -63,7 +64,7 @@ class DeviceUnregisterRequest(BaseModel):
 class MoviePilotAppPush(_PluginBase):
     plugin_name = "MoviePilot App 推送"
     plugin_desc = "为 MoviePilot iOS / macOS App 提供 APNs 远程推送"
-    plugin_version = "1.0.2"
+    plugin_version = "1.0.3"
     plugin_author = "buzhengg"
     # 与 package.v2.json 的 icon 一致；独立仓库须用 raw.githubusercontent.com 完整 URL
     plugin_icon = "https://raw.githubusercontent.com/buzhengg/MoviePilot-Plugins/main/icons/moviepilotapppush.png"
@@ -442,31 +443,19 @@ class MoviePilotAppPush(_PluginBase):
         push_title = (title or DEFAULT_TEST_TITLE).strip() or DEFAULT_TEST_TITLE
         push_body = (message or DEFAULT_TEST_BODY).strip() or DEFAULT_TEST_BODY
 
-        sent = 0
-        failed: List[dict] = []
+        devices_by_user: Dict[str, List[dict]] = {}
         for target in targets:
-            device = target.get("device") or {}
-            token = target.get("device_token") or ""
-            uname = target.get("username") or ""
-            result = self._send_to_device(
-                token=token,
-                title=push_title,
-                body=push_body,
-                link=link,
-                mtype=None,
-                use_sandbox=self._device_use_sandbox(device),
-            )
-            if result.success:
-                sent += 1
-                logger.info("App 推送：测试成功 user=%s token=%s...", uname, token[:12])
-            else:
-                reason = result.reason or f"HTTP {result.status_code}"
-                failed.append({
-                    "username": uname,
-                    "device_token": token,
-                    "reason": reason,
-                })
-                logger.warning("App 推送：测试失败 user=%s reason=%s", uname, reason)
+            devices_by_user.setdefault(target["username"], []).append(target["device"])
+
+        sent, failed = self._deliver_push(
+            usernames=[t["username"] for t in targets],
+            registry=self._load_registry(),
+            title=push_title,
+            body=push_body,
+            link=link,
+            mtype=None,
+            devices_by_user=devices_by_user,
+        )
 
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         summary = f"已向 {sent}/{len(targets)} 个设备发送测试推送"
@@ -499,48 +488,92 @@ class MoviePilotAppPush(_PluginBase):
         return {"post_message": self.send_push}
 
     def send_push(self, message: Notification, **kwargs) -> None:
-        if not self._apns_ready():
-            return None
-        if not self._system_notification_allows(message):
+        if not self._apns_ready() or not self._passes_channel_filters(message):
             return None
 
-        title = (message.title or "").strip() or "MoviePilot"
-        body = (message.text or "").strip()
-        if not body and not message.title:
-            return None
-
-        usernames = self._resolve_target_usernames(message)
-        if not usernames:
+        title, body = self._extract_notification_content(message)
+        if not title:
             return None
 
         registry = self._load_registry()
+        usernames = self._resolve_recipient_usernames(message, registry)
+        if not usernames:
+            logger.debug(
+                "App 推送：跳过「%s」，mtype=%s，无匹配接收用户",
+                title,
+                self._message_mtype_value(message),
+            )
+            return None
+
+        sent, _ = self._deliver_push(
+            usernames=usernames,
+            registry=registry,
+            title=title,
+            body=body,
+            link=message.link,
+            mtype=self._message_mtype_value(message),
+        )
+        if sent:
+            logger.info("App 推送：已向 %d 个设备发送「%s」", sent, title)
+        return None
+
+    def _config_flag(self, key: str, default: bool = False) -> bool:
+        return bool(self._config.get(key, default))
+
+    @staticmethod
+    def _extract_notification_content(message: Notification) -> Tuple[Optional[str], str]:
+        title = (message.title or "").strip() or "MoviePilot"
+        body = (message.text or "").strip()
+        if not body and not message.title:
+            return None, body
+        return title, body
+
+    def _deliver_push(
+            self,
+            *,
+            usernames: List[str],
+            registry: Dict[str, List[dict]],
+            title: str,
+            body: str,
+            link: Optional[str],
+            mtype: Optional[str],
+            devices_by_user: Optional[Dict[str, List[dict]]] = None,
+    ) -> Tuple[int, List[dict]]:
         sent = 0
+        failed: List[dict] = []
         invalid_tokens: List[Tuple[str, str]] = []
+        seen_tokens: set[str] = set()
 
         for username in usernames:
-            for device in registry.get(username, []):
+            devices = devices_by_user.get(username) if devices_by_user else registry.get(username, [])
+            for device in devices or []:
                 token = device.get("device_token")
-                if not token:
+                if not token or token in seen_tokens:
                     continue
+                seen_tokens.add(token)
+
                 result = self._send_to_device(
                     token=token,
                     title=title,
                     body=body,
-                    link=message.link,
-                    mtype=message.mtype.value if message.mtype else None,
+                    link=link,
+                    mtype=mtype,
                     use_sandbox=self._device_use_sandbox(device),
                 )
                 if result.success:
                     sent += 1
-                elif APNsClient.should_remove_token(result):
-                    invalid_tokens.append((username, token))
+                else:
+                    failed.append({
+                        "username": username,
+                        "device_token": token,
+                        "reason": result.reason or f"HTTP {result.status_code}",
+                    })
+                    if APNsClient.should_remove_token(result):
+                        invalid_tokens.append((username, token))
 
         if invalid_tokens:
             self._remove_invalid_tokens(invalid_tokens)
-
-        if sent:
-            logger.info("App 推送：已向 %d 个设备发送「%s」", sent, title)
-        return None
+        return sent, failed
 
     @staticmethod
     def _normalize_token(raw: str) -> str:
@@ -559,7 +592,7 @@ class MoviePilotAppPush(_PluginBase):
         raw = self._config.get("notification_channel_type") or NOTIFICATION_CHANNEL_TYPE
         return str(raw).strip().lower() or NOTIFICATION_CHANNEL_TYPE
 
-    def _load_system_notification_channels(self) -> List[NotificationConf]:
+    def _load_system_channels(self) -> List[NotificationConf]:
         channel_type = self._notification_channel_type()
         return [
             conf for conf in ServiceConfigHelper.get_notification_configs()
@@ -567,24 +600,63 @@ class MoviePilotAppPush(_PluginBase):
         ]
 
     @staticmethod
-    def _channel_accepts_message(conf: NotificationConf, message: Notification) -> bool:
+    def _message_mtype_value(message: Notification) -> Optional[str]:
+        if not message.mtype:
+            return None
+        return message.mtype.value if hasattr(message.mtype, "value") else str(message.mtype)
+
+    @staticmethod
+    def _matches_channel_conf(conf: NotificationConf, message: Notification) -> bool:
+        """与内置 _MessageBase.check_message 一致。"""
         if message.source and message.source != conf.name:
             return False
-        if not message.userid and message.mtype:
-            switchs = conf.switchs or []
-            if switchs and message.mtype.value not in switchs:
-                return False
-        return True
-
-    def _system_notification_allows(self, message: Notification) -> bool:
-        if not self._config.get("use_system_notification_channel", True):
+        if message.userid or not message.mtype:
             return True
+        switchs = conf.switchs or []
+        mtype_value = MoviePilotAppPush._message_mtype_value(message)
+        return bool(mtype_value and mtype_value in switchs)
 
-        channels = self._load_system_notification_channels()
+    def _passes_channel_filters(self, message: Notification) -> bool:
+        if not self._config_flag("use_system_notification_channel", True):
+            return True
+        channels = self._load_system_channels()
         if not channels:
-            return bool(self._config.get("fallback_without_channel", True))
+            return self._config_flag("fallback_without_channel", True)
+        return any(self._matches_channel_conf(conf, message) for conf in channels)
 
-        return any(self._channel_accepts_message(conf, message) for conf in channels)
+    def _get_scope_action(self, message: Notification) -> Optional[str]:
+        if not message.mtype:
+            return None
+        action = ServiceConfigHelper.get_notification_switch(message.mtype)
+        if action:
+            return action
+        mtype_value = self._message_mtype_value(message)
+        if not mtype_value:
+            return None
+        for switch in ServiceConfigHelper.get_notification_switches():
+            if switch.type == mtype_value:
+                return switch.action
+        return None
+
+    @staticmethod
+    def _usernames_for_scope(
+            message: Notification,
+            registered: set[str],
+            action: str,
+    ) -> List[str]:
+        parts = [p.strip() for p in action.split(",") if p.strip()]
+        if "all" in parts:
+            return sorted(registered)
+
+        resolved: List[str] = []
+        for part in parts:
+            if part == "admin" and settings.SUPERUSER in registered:
+                resolved.append(settings.SUPERUSER)
+            elif part == "user" and message.username:
+                un = str(message.username)
+                if un in registered:
+                    resolved.append(un)
+        return list(dict.fromkeys(resolved))
 
     def _username_from_userid(self, userid: Any) -> Optional[str]:
         try:
@@ -598,29 +670,44 @@ class MoviePilotAppPush(_PluginBase):
             return None
         return user.name if user else None
 
-    def _resolve_target_usernames(self, message: Notification) -> List[str]:
+    def _resolve_recipient_usernames(
+            self,
+            message: Notification,
+            registry: Dict[str, List[dict]],
+    ) -> List[str]:
+        if not registry:
+            return []
+
+        registered = set(registry.keys())
+
         if message.username:
-            return [str(message.username)]
+            un = str(message.username)
+            return [un] if un in registered else []
 
-        if message.userid:
-            name = self._username_from_userid(message.userid)
-            if name:
-                return [name]
+        if message.userid and (name := self._username_from_userid(message.userid)):
+            return [name] if name in registered else []
 
-        if self._config.get("push_broadcast", False):
-            registry = self._load_registry()
-            if registry:
-                return list(registry.keys())
+        if message.targets is not None:
+            admin = settings.SUPERUSER
+            return [admin] if admin and admin in registered else []
+
+        if action := self._get_scope_action(message):
+            scoped = self._usernames_for_scope(message, registered, action)
+            if scoped:
+                return scoped
+
+        if self._config_flag("push_broadcast"):
+            return list(registered)
 
         return []
 
     def _system_channel_status_text(self) -> str:
-        if not self._config.get("use_system_notification_channel", True):
+        if not self._config_flag("use_system_notification_channel", True):
             return "已关闭系统通知渠道联动，仅按插件内规则转发。"
-        channels = self._load_system_notification_channels()
+        channels = self._load_system_channels()
         channel_type = self._notification_channel_type()
         if not channels:
-            if self._config.get("fallback_without_channel", True):
+            if self._config_flag("fallback_without_channel", True):
                 return (
                     f"未在「设定 → 通知」中配置 type={channel_type} 的自定义渠道；"
                     "当前使用插件兜底规则（未配置渠道时仍可能推送）。"
